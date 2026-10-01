@@ -1,0 +1,22 @@
+﻿
+# local credentials - never commit
+.secrets/
+
+# ---------- added: never commit secrets / harness internals / logs ----------
+.skill-build/
+.dsh-inspect/
+*secret*
+*cookie*
+*token*
+*credential*
+Get-RdpCredential.ps1
+*.log
+*.tmp
+Thumbs.db
+*.bak
+*.orig
+*.user
+*.suo
+.DS_Store
+bin/
+obj/
