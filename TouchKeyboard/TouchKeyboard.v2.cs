@@ -268,7 +268,7 @@ public class TouchKeyboard : Form
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
-        if (startHidden) { startHidden = false; Hide(); }   // -hidden：启动即缩到托盘，等自动呼出
+        if (startHidden) { startHidden = false; if (dockBottom && appbarRegistered) { UnregisterAppBar(); RestoreWorkArea(true); dockClosed = true; } Hide(); }   // -hidden：启动即缩到托盘，等自动呼出
     }
 
     static bool GetArg(string name)
