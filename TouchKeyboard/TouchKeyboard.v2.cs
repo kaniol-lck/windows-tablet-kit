@@ -66,7 +66,7 @@ public class TouchKeyboard : Form
     const uint SWP_NOACTIVATE = 0x0010;
     const uint SPI_SETWORKAREA = 0x002F, SPI_GETWORKAREA = 0x0030, SPIF_SENDCHANGE = 0x02, WM_SETTINGCHANGE = 0x001A;
     static readonly IntPtr HWND_BROADCAST = new IntPtr(0xFFFF);
-    const uint ABM_NEW = 0, ABM_REMOVE = 1, ABM_QUERYPOS = 2, ABM_SETPOS = 3, ABM_GETTASKBARPOS = 5;
+    const uint ABM_NEW = 0, ABM_REMOVE = 1, ABM_QUERYPOS = 2, ABM_SETPOS = 3, ABM_GETSTATE = 4, ABM_GETTASKBARPOS = 5;
     const uint ABE_LEFT = 0, ABE_TOP = 1, ABE_RIGHT = 2, ABE_BOTTOM = 3;
     const int WM_APPBAR = 0x8000 + 200;
     bool appbarRegistered = false;
@@ -1677,10 +1677,14 @@ public class TouchKeyboard : Form
         int bottom = b.Bottom;
         try
         {
+            APPBARDATA st = new APPBARDATA();
+            st.cbSize = Marshal.SizeOf(typeof(APPBARDATA));
+            uint abs = (uint)SHAppBarMessage(ABM_GETSTATE, ref st);
+            if ((abs & 0x1) != 0) return b.Bottom;    // taskbar auto-hidden (tablet mode) -> flush to the screen bottom
             APPBARDATA tb = new APPBARDATA();
             tb.cbSize = Marshal.SizeOf(typeof(APPBARDATA));
             if (SHAppBarMessage(ABM_GETTASKBARPOS, ref tb) != IntPtr.Zero)
-                if (tb.uEdge == ABE_BOTTOM && tb.rc.Top > b.Top && tb.rc.Top < b.Bottom && (b.Bottom - tb.rc.Top) <= 200) bottom = tb.rc.Top;   // 旋转瞬间可能返回陈旧矩形，任务栏不可能有 200px 以上
+                if (tb.uEdge == ABE_BOTTOM && tb.rc.Top > b.Top && tb.rc.Top < b.Bottom && (b.Bottom - tb.rc.Top) <= 200) bottom = tb.rc.Top;
         }
         catch { }
         return bottom;
