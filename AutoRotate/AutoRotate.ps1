@@ -4,14 +4,22 @@
   适用：系统自带"简单设备方向传感器/SensorService"被删除、但加速度计仍可用的 Windows 10
   依赖：系统自带 Windows PowerShell 5.1 + WinRT 传感器 API + user32 显示 API（无需安装任何东西）
 
+  「旋转锁定」：默认跟随系统（控制中心/操作中心里的"旋转锁定"磁贴、
+                设置 → 系统 → 显示 → 旋转锁定，写的是同一个注册表值）
+                HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AutoRotation\Enable
+                  0 = 旋转锁定开 → 本脚本停止自动旋转（手动旋转仍可用）
+                  1 = 旋转锁定关 → 正常自动旋转
+                可用 config.json 的 respectRotationLock=false 或 -IgnoreLock 忽略它。
+
   用法：
     无参数          常驻轮询，自动旋转（推荐由"安装-开机自动旋转.cmd"注册成登录启动）
-    -Status         打印当前状态（重力/判定/当前方向），不改画面
-    -SelfTest       能力自检（显示器是否支持 4 个方向 + 加速度计是否可用），不改画面
+    -Status         打印当前状态（重力/判定/当前方向/旋转锁定），不改画面
+    -SelfTest       能力自检（显示器是否支持 4 个方向 + 加速度计 + 旋转锁定），不改画面
     -Once           判定一次并直接应用
     -Set N          手动旋转到指定方向：0=横向 1=纵向 2=横向翻转 3=纵向翻转
     -Calibrate      交互校准：记录四个姿势的重力向量，并确认纵向方向
     -SwapPortrait   临时反转纵向(1/3)的映射关系
+    -IgnoreLock     本次运行忽略系统"旋转锁定"（临时覆盖，便于排查）
 #>
 param(
   [switch]$Calibrate,
@@ -19,6 +27,7 @@ param(
   [switch]$SelfTest,
   [switch]$Status,
   [switch]$SwapPortrait,
+  [switch]$IgnoreLock,
   [int]$Set = -1
 )
 
@@ -101,6 +110,7 @@ function Get-DefaultConfig {
     minInPlane   = 0.35
     stableCount  = 4
     intervalMs   = 400
+    respectRotationLock = $true
     poses        = @(
       [pscustomobject]@{ name = '横向';                 x =  0.0; y = -1.0; orient = 0 }
       [pscustomobject]@{ name = '纵向(上边缘朝左)';      x = -1.0; y =  0.0; orient = 1 }
@@ -110,12 +120,21 @@ function Get-DefaultConfig {
   }
 }
 function Load-Config {
+  $def = Get-DefaultConfig
   if (Test-Path $CfgPath) {
-    try { return (Get-Content -LiteralPath $CfgPath -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { Say "config.json 读取失败，改用默认配置：$_" 'Yellow' }
+    try {
+      $c = Get-Content -LiteralPath $CfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+      # 旧版 config.json 缺少新增字段时用默认值补齐（例如 respectRotationLock）
+      foreach ($p in $def.PSObject.Properties) {
+        if ($null -eq $c.PSObject.Properties[$p.Name]) {
+          $c | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value -Force
+        }
+      }
+      return $c
+    } catch { Say "config.json 读取失败，改用默认配置：$_" 'Yellow' }
   }
-  $cfg = Get-DefaultConfig
-  Save-Config $cfg
-  return $cfg
+  Save-Config $def
+  return $def
 }
 function Save-Config($cfg) {
   $cfg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $CfgPath -Encoding UTF8
@@ -142,6 +161,28 @@ function Resolve-Orient($pose, $cfg, $swap) {
 }
 $OrientName = @{ 0 = '横向'; 1 = '纵向'; 2 = '横向翻转'; 3 = '纵向翻转' }
 
+# ---------------------------------------------------------------- 系统旋转锁定
+# 控制中心（Win+A）/ 设置→显示 里的"旋转锁定"，最终写的就是这个注册表值：
+#   Enable = 0 → 旋转锁定开（不允许自动旋转）
+#   Enable = 1 → 旋转锁定关（允许自动旋转）
+# SlateEnable 一起读出来仅供诊断（部分机型用它控制磁贴是否置灰）。
+$LockKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AutoRotation'
+function Get-RotationLockInfo {
+  $o = [pscustomobject]@{ Enable = $null; SlateEnable = $null; Locked = $null; Error = $null }
+  try {
+    $p = Get-ItemProperty -LiteralPath $LockKey -ErrorAction Stop
+    $o.Enable = $p.Enable; $o.SlateEnable = $p.SlateEnable
+    if ($null -ne $p.Enable) { $o.Locked = ([int]$p.Enable -eq 0) }
+  } catch { $o.Error = $_.Exception.Message }
+  return $o
+}
+function Get-LockText($info) {
+  if ($info.Error) { return "读取失败（按未锁定处理）：$($info.Error)" }
+  if ($null -eq $info.Locked) { return '读不到 Enable 值（按未锁定处理）' }
+  if ($info.Locked) { return "已锁定（旋转锁定开着，Enable=$($info.Enable)）→ 不自动旋转，手动旋转仍可用" }
+  return "未锁定（旋转锁定关着，Enable=$($info.Enable)）→ 正常自动旋转"
+}
+
 # ---------------------------------------------------------------- 自检 / 状态
 if ($SelfTest) {
   Say "==== AutoRotate 自检 ====" 'Cyan'
@@ -157,9 +198,13 @@ if ($SelfTest) {
     Say ("  平面内重力   : {0:N3}  (小于 minInPlane 时视为水平放置，不旋转)" -f ([Math]::Sqrt($g.X * $g.X + $g.Y * $g.Y)))
   }
   else { Say "加速度计       : 不可用" 'Red' }
+  $lock = Get-RotationLockInfo
+  Say ("系统旋转锁定   : " + (Get-LockText $lock))
+  Say ("  注册表原值   : Enable=$($lock.Enable)  SlateEnable=$($lock.SlateEnable)  ($LockKey)")
   $cfg = Load-Config
   $p = Classify $g $cfg
   Say ("当前判定姿势   : " + $(if ($p) { "$($p.name) -> 应转 $((Resolve-Orient $p $cfg $SwapPortrait)) 度档位" } else { '无法判定（水平放置）' }))
+  Say ("跟随旋转锁定   : respectRotationLock=$($cfg.respectRotationLock)$(if ($IgnoreLock) { '（本次命令行用 -IgnoreLock 覆盖）' })")
   Say ("配置文件       : $CfgPath")
   return
 }
@@ -173,8 +218,10 @@ if ($Status) {
   Say "显示器  : $([DisplayApi]::Describe())"
   Say "重力    : X=$gx  Y=$gy  Z=$gz"
   Say "判定    : $(if ($p) { $p.name } else { '无法判定（水平放置）' })"
-  Say "配置    : swapPortrait=$($cfg.swapPortrait)  minInPlane=$($cfg.minInPlane)  stableCount=$($cfg.stableCount)  intervalMs=$($cfg.intervalMs)"
+  Say "配置    : swapPortrait=$($cfg.swapPortrait)  minInPlane=$($cfg.minInPlane)  stableCount=$($cfg.stableCount)  intervalMs=$($cfg.intervalMs)  respectRotationLock=$($cfg.respectRotationLock)"
   Say "暂停标记: $(if (Test-Path $PauseFlag) { '存在（自动旋转已暂停）' } else { '不存在' })"
+  $lock = Get-RotationLockInfo
+  Say "旋转锁定: $(Get-LockText $lock)"
   exit 0
 }
 
@@ -246,6 +293,8 @@ if ($Once) {
   if (-not $p) { Say "无法判定（设备可能水平放置）"; exit 0 }
   $o = Resolve-Orient $p $cfg $SwapPortrait
   $cur = [DisplayApi]::CurrentOrientation()
+  $lock = Get-RotationLockInfo
+  if ($lock.Locked) { Say "提示：系统旋转锁定开着，但这是手动操作，仍会执行。" 'DarkGray' }
   Say ("判定：{0} -> 目标 {1}({2})，当前 {3}" -f $p.name, $o, $OrientName[$o], $cur)
   if ($o -ne $cur) { $r = [DisplayApi]::Apply($o); Say ("已旋转，返回 $r") 'Green'; Log "单次旋转 $cur -> $o ($($p.name))" }
   else { Say "方向已正确，无需旋转" }
@@ -257,13 +306,29 @@ if ($Once) {
 $script:Mtx = New-Object System.Threading.Mutex($false, 'Local\AutoRotate_SingleInstance')
 if (-not $script:Mtx.WaitOne(0)) { Say "已有 AutoRotate 实例在运行，本实例退出。" 'Yellow'; exit 0 }
 $cfg = Load-Config
+$cfgRespectLock = -not $IgnoreLock -and [bool]$cfg.respectRotationLock
 Say "AutoRotate 已启动（配置文件 $CfgPath，日志 $LogPath）" 'Green'
 Say "若需暂停：在本目录新建空文件 pause.flag；恢复：删掉它。" 'DarkGray'
+if ($cfgRespectLock) { Say "已启用：跟随控制中心/设置里的「旋转锁定」（锁定=本脚本不自动旋转，手动旋转仍可用）" 'DarkGray' }
+elseif ($IgnoreLock) { Say "注意：本次用 -IgnoreLock 启动，忽略系统「旋转锁定」。" 'Yellow' }
+else { Say "注意：respectRotationLock 已关闭，本脚本不跟随系统「旋转锁定」。" 'Yellow' }
 Log "==== 启动 ===="
-$candidate = $null; $stable = 0; $fail = 0
+if ($cfgRespectLock) { Log "跟随系统旋转锁定：已启用" } elseif ($IgnoreLock) { Log "跟随系统旋转锁定：本次以 -IgnoreLock 忽略" }
+$candidate = $null; $stable = 0; $fail = 0; $wasLocked = $null
 while ($true) {
   try {
     if (Test-Path $PauseFlag) { Start-Sleep -Milliseconds 1000; continue }
+    if ($cfgRespectLock) {
+      $lock = Get-RotationLockInfo
+      if ($lock.Locked) {
+        if (-not $wasLocked) { Log "系统旋转锁定：已锁定（Enable=$($lock.Enable)），暂停自动旋转"; Say "系统旋转锁定开着 → 暂停自动旋转（解锁后自动恢复）" 'Yellow' }
+        $wasLocked = $true; $candidate = $null; $stable = 0
+        Start-Sleep -Milliseconds 1000
+        continue
+      }
+      if ($wasLocked) { Log "系统旋转锁定：已解锁（Enable=$($lock.Enable)），恢复自动旋转"; Say "系统旋转锁定已关闭 → 恢复自动旋转" 'Green' }
+      $wasLocked = $false
+    }
     $g = Get-Gravity
     $p = Classify $g $cfg
     if ($p) {

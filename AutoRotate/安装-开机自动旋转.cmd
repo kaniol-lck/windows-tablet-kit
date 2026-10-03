@@ -1,21 +1,14 @@
 @echo off
 chcp 65001 >nul
-rem ---- self-elevate (creating an elevated scheduled task needs admin) ----
+rem ---- self-elevate (Register-ScheduledTask needs admin) ----
 net session >nul 2>&1
 if errorlevel 1 (
   powershell.exe -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
   exit /b
 )
-echo Installing scheduled task "AutoRotate" (run at logon, elevated)...
-schtasks /create /tn "AutoRotate" /tr "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File %~dp0AutoRotate.ps1" /sc onlogon /rl highest /f
-if errorlevel 1 (
-  echo.
-  echo [FAILED] Could not create the task. Run this file as %USERNAME%.
-  pause
-  exit /b 1
-)
-schtasks /run /tn "AutoRotate"
+echo Installing / repairing AutoRotate autostart (logon task + startup folder fallback)...
 echo.
-echo [OK] Task installed and started. Auto-rotation is on.
-echo      To remove it later, run the uninstall .cmd in this folder.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-AutoStart.ps1"
+echo.
+echo If "daemon started" above is not confirmed, read the log lines printed above.
 pause

@@ -30,6 +30,11 @@
 ### AutoRotate —— 重力自动旋转守护（PowerShell）
 
 - WinRT 加速度计读取姿态 + Win32 `ChangeDisplaySettingsEx` 旋转屏幕
+- **跟随系统「旋转锁定」**：默认读取
+  `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AutoRotation\Enable`
+  （控制中心 / 操作中心里的「旋转锁定」磁贴、设置 → 系统 → 显示 → 旋转锁定，写的是同一个值；
+  `0` = 锁定开，`1` = 允许自动旋转）。锁定开着时自动旋转暂停、手动旋转仍可用，解锁后自动恢复；
+  可用 `config.json` 的 `respectRotationLock: false` 或命令行 `-IgnoreLock` 关掉这一行为
 - 附带手动旋转 / 暂停 / 校准 / 自检的一键脚本（`.cmd`）
 - 单实例互斥，支持暂停标记文件，日志记录每次旋转结果
 
@@ -78,6 +83,13 @@ Add-Type -TypeDefinition $code -Language CSharp `
 
 ## 使用要点
 
+- **AutoRotate 的自启动有两个入口**：计划任务 `AutoRotate` 与启动文件夹里的 `AutoRotate.vbs`，
+  两者互为备份（单实例互斥保证只跑一个）。`schtasks /create` 建出来的任务默认带
+  「电池供电时不启动 / 切到电池就停止」和 72 小时执行上限 —— 平板用电池时会导致
+  「装了自启但没在跑」；`AutoRotate\安装-开机自动旋转.cmd` 已改为用 `Register-ScheduledTask`
+  注册电池友好、无时限的任务，并在启动后**用日志增长校验**、最后打印结果。
+  屏幕不自动转时：先跑 `AutoRotate\状态与自检.cmd`（看守护进程是否在跑、旋转锁定是否开着），
+  再跑 `AutoRotate\安装-开机自动旋转.cmd` 重装自启。
 - 首次运行会在 exe 同级生成 `layouts.ini`（键盘布局）与 `TouchKeyboard.ini`（设置）
 - 命令行参数：`-show` 启动即显示、`-hidden` 启动即驻留托盘、`-dock` 启动即贴底、
   `-nosnap` 关闭吸附、`-auto` / `-noauto` 自动呼出开关、`-debug` 写 `kb-debug.log` 便于排查
