@@ -602,7 +602,7 @@ public class TouchKeyboard : Form
                 for (int i = -2; i <= 2; i++) e.Graphics.DrawLine(p, cx + i * 18 - 8, 9, cx + i * 18 - 8, dockGrip.Height - 9);
             }
             using (SolidBrush br = new SolidBrush(Color.FromArgb(228, 228, 238)))
-            using (Font f = new Font("Microsoft YaHei UI", 9f))
+            using (Font f = new Font("Microsoft YaHei UI", 8.5f))
             {
                 int h = (dockHeightUser > 0) ? dockHeightUser : Height;
                 e.Graphics.DrawString("按住这条上下拖动可调整贴底高度（当前 " + h + " px）", f, br, new PointF(14, 6));
@@ -616,7 +616,7 @@ public class TouchKeyboard : Form
         try
         {
             using (SolidBrush br = new SolidBrush(Color.FromArgb(228, 228, 238)))
-            using (Font f = new Font("Microsoft YaHei UI", 9f, FontStyle.Bold))
+            using (Font f = new Font("Microsoft YaHei UI", 8.5f, FontStyle.Regular))
                 e.Graphics.DrawString("◢ 拖拽缩放", f, br, new PointF(8, 5));
         }
         catch { }
@@ -761,7 +761,7 @@ public class TouchKeyboard : Form
         b.FlatStyle = FlatStyle.Flat;
         b.FlatAppearance.BorderSize = 0;
         b.TabStop = false;
-        b.Font = new Font("Microsoft YaHei UI", 9f, FontStyle.Bold);
+        b.Font = new Font("Microsoft YaHei UI", 8.5f, FontStyle.Regular);
         b.Size = new Size(role == "layout" ? 116 : (role == "sticky" ? 116 : 92), stripH - 10);
         b.Click += new EventHandler(HeaderClick);
         strip.Controls.Add(b);
@@ -851,6 +851,23 @@ public class TouchKeyboard : Form
         Text = "触控键盘  " + (autoShow ? "[自动呼出]" : "") + (dockBottom ? "[贴底]" : "");
     }
 
+    // 键帽字体：随键高缩放，Regular 字重；再按实测文本宽度收缩，保证键帽文字永不折行
+    Font KeyFont(string text, int kw, int kh)
+    {
+        float fs = kh * 0.26f;                 // 44px 键高 -> 11.4pt；84px -> 16pt（上限）
+        if (fs < 9f) fs = 9f;
+        else if (fs > 16f) fs = 16f;
+        int limit = kw - 8;                    // 留出左右内边距
+        while (fs > 8f)
+        {
+            Size ts;
+            using (Font probe = new Font("Segoe UI", fs, FontStyle.Regular))
+                ts = TextRenderer.MeasureText(text, probe);
+            if (ts.Width <= limit) break;
+            fs -= 0.5f;
+        }
+        return new Font("Segoe UI", fs, FontStyle.Regular);
+    }
     void BuildKeys()
     {
         building = true;
@@ -887,7 +904,7 @@ public class TouchKeyboard : Form
                 b.FlatAppearance.BorderSize = 0;
                 b.TabStop = false;
                 b.ForeColor = Color.White;
-                b.Font = new Font("Segoe UI", Math.Max(9f, Math.Min(kh * 0.34f, 22f)) < 14f ? 11f : Math.Min(kh * 0.34f, 22f), FontStyle.Bold);
+                b.Font = KeyFont(b.Text, kw, kh);
                 b.Size = new Size(kw, kh);
                 b.Location = new Point((int)Math.Round(x), y);
                 b.BackColor = (k.Latch != null) ? Color.FromArgb(58, 72, 100) : (k.IsClose ? Color.FromArgb(110, 45, 45) : Color.FromArgb(62, 62, 68));
