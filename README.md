@@ -25,7 +25,13 @@
 - **粘滞键**：`关`（`⇧` 锁定）/ `单次`（修饰键只对下一个按键生效）
 - 托盘常驻、可选开机自启；不抢焦点（`WS_EX_NOACTIVATE`）；
   不进入任务栏 / Alt+Tab / 任务视图（`WS_EX_TOOLWINDOW`）
-- 单实例运行；窗口位置、尺寸、各开关状态持久化到同目录 `TouchKeyboard.ini`
+- **单实例运行 = 开关语义**：键盘已在运行时再次启动它，不弹「已在运行」提示框，而是让运行中的实例
+  **显示 ↔ 隐藏**（命名事件 `TouchKeyboard_ToggleRequest_v2`），后启动的实例静默退出。
+  正因如此，它可以被系统的触摸键盘入口（任务栏按钮 / `Win+Ctrl+O`）直接当目标拉起；
+  每次启动还会在 exe 同级 `kb-launch.log` 记一行「命令行 + 账户 + 会话号」，便于排查是谁拉起的
+- 窗口位置、尺寸、各开关状态持久化到同目录 `TouchKeyboard.ini`
+- **接管系统触摸键盘入口**：见 [`OskRedirect/`](OskRedirect/README.md) ——
+  把任务栏「触摸键盘」按钮、`osk.exe`、`TabTip.exe` 都重定向到本键盘（适合 TabTip 被删掉的精简系统）
 
 ### AutoRotate —— 重力自动旋转守护（PowerShell）
 
@@ -44,6 +50,7 @@
 |---|---|
 | `RotationCheck/` | 屏幕方向与 `ConvertibleSlateMode`（平板 / 笔记本模式）诊断 |
 | `OskCheck/` | 系统屏幕键盘（TabTip / osk）可用性检查 |
+| `OskRedirect/` | 把系统「触摸键盘」入口（任务栏按钮 / `osk.exe` / `TabTip.exe`）重定向到自研键盘 |
 | `UpdateControl/` | Windows 更新的分层禁用 / 恢复（策略 + 服务 + 计划任务） |
 | `Migration/` | 用户配置迁移到新账号 |
 
@@ -59,6 +66,7 @@ windows-tablet-kit/
 ├─ AutoRotate/             # 重力自动旋转守护 + 一键脚本
 ├─ RotationCheck/          # 屏幕方向 / 平板模式诊断
 ├─ OskCheck/               # 屏幕键盘诊断
+├─ OskRedirect/            # 把系统触摸键盘入口重定向到本键盘（安装 / 卸载脚本）
 ├─ UpdateControl/          # 系统更新禁用 / 恢复
 ├─ Migration/              # 配置迁移
 ├─ NB_TouchKeyboard_资料/  # 第三方同类方案的文字说明（不含其二进制）
@@ -92,7 +100,10 @@ Add-Type -TypeDefinition $code -Language CSharp `
   再跑 `AutoRotate\安装-开机自动旋转.cmd` 重装自启。
 - 首次运行会在 exe 同级生成 `layouts.ini`（键盘布局）与 `TouchKeyboard.ini`（设置）
 - 命令行参数：`-show` 启动即显示、`-hidden` 启动即驻留托盘、`-dock` 启动即贴底、
-  `-nosnap` 关闭吸附、`-auto` / `-noauto` 自动呼出开关、`-debug` 写 `kb-debug.log` 便于排查
+  `-nosnap` 关闭吸附、`-auto` / `-noauto` 自动呼出开关、`-debug` 写 `kb-debug.log` 便于排查、
+  `-comserve` 额外注册 `CLSID_UIHostNoLaunch` 的 COM 类工厂（**默认关闭**，原因见
+  [`OskRedirect/README.md`](OskRedirect/README.md) 第三节：精简系统上没有该接口的 ProxyStub，
+  跨进程必然 `E_NOINTERFACE`，注册只会招来每 2 分钟一次的失败重试）
 - 布局文件格式见 `layouts.ini` 头部注释：`Row: 键名[*宽度] ...`，支持
   单字符、`esc tab caps enter bk del ins home end pgup pgdn shift ctrl alt win space zh close left up down right f1..f12`
 - 贴底状态下请通过键盘上的「贴底」开关或托盘菜单退出；**强杀进程可能让 Windows 残留 AppBar 占位**
@@ -107,6 +118,9 @@ Add-Type -TypeDefinition $code -Language CSharp `
 - **多指同时操作**（一根手指按住修饰键、另一根指点字母）在部分环境不可用：
   Windows 只把首个触点模拟为鼠标事件；`WM_TOUCH` 多点通路在真机上未充分验证，故默认关闭
 - 贴底占位依赖 Windows AppBar 机制，不同系统版本表现可能略有差异
+- **被系统触摸键盘服务拉起时可能是 SYSTEM 身份**（`OskRedirect/` 的做法）：键盘能显示、能输入，
+  但托盘图标的右键菜单可能点不动（UIPI 不允许低完整性进程给高完整性窗口发消息）。
+  用键盘上的 `✕` 关掉后，从开始菜单快捷方式重新启动即可回到用户身份
 
 ## 免责声明
 

@@ -9,6 +9,98 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
 
+// ============================ 接管系统「触摸键盘」按钮 ============================
+// 本机系统被精简后，任务栏触摸键盘按钮（TIPBand）依赖的两个 CLSID 注册项都不存在：
+//   CLSID_UIHostNoLaunch = {4CE576FA-83DC-4F88-951C-9D0782B4E376}   ← 第三方/外壳用它拿 ITipInvocation::Toggle
+//   TabSvc 的 CTabTipProcessInfo  = {054AAE20-4BEA-4347-8A35-64A533254A9D}  ← 服务从这里读 LocalServer32 取 exe 路径
+// 安装脚本把这两个 CLSID 的 LocalServer32 指到本 exe：
+//   ① 外壳若走 CoCreateInstance，本 exe 注册的类工厂会收到 Toggle()；
+//   ② 服务若直接 CreateProcess（命令行带 -Embedding），本 exe 用兜底定时器自己显示。
+[ComVisible(true), Guid("37C994E7-432B-4834-A2F7-DCE1F13B834B"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface ITipInvocation
+{
+    void Toggle(IntPtr hwnd);
+}
+
+[ComVisible(true), Guid("00000001-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IClassFactorySrv
+{
+    [PreserveSig] int CreateInstance(IntPtr pUnkOuter, ref Guid riid, out IntPtr ppvObject);
+    [PreserveSig] int LockServer(bool fLock);
+}
+
+[ComVisible(true)]
+public class TipInvoker : ITipInvocation
+{
+    public void Toggle(IntPtr hwnd) { TipKeyboardCom.RequestToggle(); }
+}
+
+[ComVisible(true)]
+public class TipKeyboardCom : IClassFactorySrv
+{
+    public const string ClsidHostNoLaunch = "4CE576FA-83DC-4F88-951C-9D0782B4E376";
+    public const string ClsidTabTip = "054AAE20-4BEA-4347-8A35-64A533254A9D";
+    public static volatile bool PendingToggle = false;
+
+    public static readonly Guid IidUnknown = new Guid("00000000-0000-0000-C000-000000000046");
+    public static readonly Guid IidTipInvocation = new Guid("37C994E7-432B-4834-A2F7-DCE1F13B834B");
+
+    public static void RequestToggle() { PendingToggle = true; }
+
+    public int CreateInstance(IntPtr pUnkOuter, ref Guid riid, out IntPtr ppvObject)
+    {
+        ppvObject = IntPtr.Zero;
+        if (pUnkOuter != IntPtr.Zero) return unchecked((int)0x80040110);      // CLASS_E_NOAGGREGATION
+        RequestToggle();                                                     // ★ 有人来激活触摸键盘类 = 一次开关请求
+        try
+        {
+            TipInvoker inv = new TipInvoker();
+            if (riid == IidUnknown) ppvObject = Marshal.GetIUnknownForObject(inv);
+            else if (riid == IidTipInvocation) ppvObject = Marshal.GetComInterfaceForObject(inv, typeof(ITipInvocation));
+            else return unchecked((int)0x80004002);                           // E_NOINTERFACE
+            return 0;
+        }
+        catch (Exception ex) { return ex.HResult; }
+    }
+
+    public int LockServer(bool fLock) { return 0; }
+
+    [DllImport("ole32.dll")]
+    static extern int CoRegisterClassObject(ref Guid rclsid, IntPtr pUnk, uint dwClsContext, uint flags, out uint lpdwRegister);
+
+    // 注册两个 CLSID 的类工厂（CLSCTX_LOCAL_SERVER + REGCLS_MULTIPLEUSE），失败静默忽略
+    public static void Register()
+    {
+        RegisterOne(ClsidHostNoLaunch);
+        RegisterOne(ClsidTabTip);
+    }
+
+    static void RegisterOne(string text)
+    {
+        try
+        {
+            Guid clsid = new Guid(text);
+            TipKeyboardCom f = new TipKeyboardCom();
+            IntPtr p = Marshal.GetComInterfaceForObject(f, typeof(IClassFactorySrv));
+            uint cookie = 0;
+            int hr = CoRegisterClassObject(ref clsid, p, 4, 1, out cookie);
+            Marshal.Release(p);
+            if (hr != 0) DbgCom("register " + text + " hr=0x" + hr.ToString("X8"));
+        }
+        catch (Exception ex) { DbgCom("register " + text + " ex=" + ex.Message); }
+    }
+
+    static void DbgCom(string s)
+    {
+        try
+        {
+            string p = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "kb-launch.log");
+            File.AppendAllText(p, DateTime.Now.ToString("HH:mm:ss") + "  COM " + s + "\r\n", Encoding.UTF8);
+        }
+        catch { }
+    }
+}
+
 public class TouchKeyboard : Form
 {
     // ============================ Win32 ============================
@@ -261,6 +353,17 @@ public class TouchKeyboard : Form
         }
         RefreshHeader();
         RefreshTrayText();
+
+        try { CoInitializeEx(IntPtr.Zero, 2); } catch { }        // 确保本线程已初始化 COM（注册类工厂要用）
+        if (GetArg("-comserve")) TipKeyboardCom.Register();      // 默认不注册类工厂：本机无 ProxyStub，跨进程拿不到 ITipInvocation，注册只会招来反复激活
+        if (GetArg("-embedding") || GetArg("/embedding"))
+        {
+            startHidden = true;                                  // COM 拉起：先不显示，等 Toggle()
+            embedGuard = new Timer();
+            embedGuard.Interval = 1200;
+            embedGuard.Tick += new EventHandler(EmbedGuardTick);
+            embedGuard.Start();
+        }
     }
 
     bool startHidden = false;
@@ -1202,6 +1305,7 @@ public class TouchKeyboard : Form
 
     void CaretTick(object s, EventArgs e)
     {
+        if (TipKeyboardCom.PendingToggle) { TipKeyboardCom.PendingToggle = false; ToggleVisible(); }   // 系统触摸键盘按钮 / 第二实例
         if (!autoShow) return;
         if (settling) return;                  // 贴底摆放期间不要弹出来
         try
@@ -1899,6 +2003,25 @@ public class TouchKeyboard : Form
         base.OnFormClosing(e);
     }
 
+    // ============================ 系统触摸键盘按钮 / 第二实例 ============================
+    Timer embedGuard = null;                 // -Embedding 拉起时的兜底显示定时器
+    bool embedToggleSeen = false;            // 是否已经收到过 Toggle()
+
+    [DllImport("ole32.dll")] static extern int CoInitializeEx(IntPtr pvReserved, uint dwCoInit);
+
+    void ToggleVisible()
+    {
+        embedToggleSeen = true;
+        if (Visible) HideKeyboard(true); else ShowKeyboard(true);
+        RefreshHeader();
+    }
+
+    void EmbedGuardTick(object s, EventArgs e)
+    {
+        try { if (embedGuard != null) { embedGuard.Stop(); embedGuard.Dispose(); embedGuard = null; } } catch { }
+        if (!embedToggleSeen && !Visible) ShowKeyboard(true);      // 调用方没走 COM（服务直接拉起）→ 自己显示
+    }
+
     // ============================ 入口 ============================
     [STAThread]
     public static void Main()
@@ -1907,9 +2030,25 @@ public class TouchKeyboard : Form
         System.Threading.Mutex mtx = new System.Threading.Mutex(true, "TouchKeyboard_SingleInstance", out created);
         if (!created)
         {
+            // 已有实例在跑：请求它显示/隐藏（与系统触摸键盘按钮同样的开关语义），不再弹提示框
+            for (int i = 0; i < 15; i++)
+            {
+                try
+                {
+                    using (System.Threading.EventWaitHandle ev = System.Threading.EventWaitHandle.OpenExisting(ToggleEventName))
+                    {
+                        ev.Set();
+                        return;
+                    }
+                }
+                catch (System.Threading.WaitHandleCannotBeOpenedException) { System.Threading.Thread.Sleep(100); }
+                catch { break; }
+            }
             MessageBox.Show("触控键盘已在运行（右下角托盘图标）。", "触控键盘", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
+        StartToggleListener();
+        LogLaunch();
         debugLog = GetArgStatic("-debug");
         if (debugLog)
         {
@@ -1928,5 +2067,48 @@ public class TouchKeyboard : Form
         Application.ApplicationExit += delegate(object s, EventArgs e) { HideTrayNow(); };
         Application.Run(new TouchKeyboard());
         GC.KeepAlive(mtx);
+    }
+
+    // ---- 第二实例 → 第一实例的开关请求（同会话命名事件，无需管理员） ----
+    const string ToggleEventName = "TouchKeyboard_ToggleRequest_v2";
+    static System.Threading.EventWaitHandle toggleEvent = null;
+
+    static void StartToggleListener()
+    {
+        try
+        {
+            toggleEvent = new System.Threading.EventWaitHandle(false, System.Threading.EventResetMode.AutoReset, ToggleEventName);
+            System.Threading.Thread t = new System.Threading.Thread(delegate()
+            {
+                while (true)
+                {
+                    try
+                    {
+                        if (!toggleEvent.WaitOne()) break;
+                        TipKeyboardCom.PendingToggle = true;
+                    }
+                    catch { break; }
+                }
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+        catch { }
+    }
+
+    // 记录每次启动的命令行 / 账户 / 会话，便于确认是谁拉起的（-Embedding = COM 拉起）
+    static void LogLaunch()
+    {
+        try
+        {
+            string p = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "kb-launch.log");
+            string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
+                + "  args=" + string.Join(" ", Environment.GetCommandLineArgs())
+                + "  user=" + Environment.UserName
+                + "  session=" + System.Diagnostics.Process.GetCurrentProcess().SessionId
+                + "\r\n";
+            File.AppendAllText(p, line, Encoding.UTF8);
+        }
+        catch { }
     }
 }
