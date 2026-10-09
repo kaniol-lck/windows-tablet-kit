@@ -2026,8 +2026,24 @@ public class TouchKeyboard : Form
     [STAThread]
     public static void Main()
     {
+        AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e)
+        {
+            LogCrash("UnhandledException", e.ExceptionObject as Exception);
+        };
         bool created = false;
-        System.Threading.Mutex mtx = new System.Threading.Mutex(true, "TouchKeyboard_SingleInstance", out created);
+        System.Threading.Mutex mtx = null;
+        try
+        {
+            mtx = new System.Threading.Mutex(true, "TouchKeyboard_SingleInstance", out created, WorldAccessibleMutex());
+        }
+        catch (Exception ex)
+        {
+            // 已有实例、但它的 DACL 不允许我们打开（典型：对方是 SYSTEM 身份创建的互斥体）
+            // ★ 这里曾经抛 UnauthorizedAccessException 直接崩掉并弹错误框（每次开机必现）→ 现在只记一笔就退出
+            LogLaunch(false, "mutex-open-denied:" + ex.GetType().Name);
+            return;
+        }
+        LogLaunch(created, "mutex");
         if (!created)
         {
             // 已有实例在跑：请求它显示/隐藏（与系统触摸键盘按钮同样的开关语义），不再弹提示框
@@ -2042,13 +2058,12 @@ public class TouchKeyboard : Form
                     }
                 }
                 catch (System.Threading.WaitHandleCannotBeOpenedException) { System.Threading.Thread.Sleep(100); }
-                catch { break; }
+                catch (Exception ex) { LogLaunch(false, "event-open-failed:" + ex.GetType().Name); return; }
             }
-            MessageBox.Show("触控键盘已在运行（右下角托盘图标）。", "触控键盘", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            LogLaunch(false, "event-timeout");            // 信号发不出去也不弹框
             return;
         }
         StartToggleListener();
-        LogLaunch();
         debugLog = GetArgStatic("-debug");
         if (debugLog)
         {
@@ -2062,7 +2077,7 @@ public class TouchKeyboard : Form
         try { SetProcessDPIAware(); } catch { }
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        Application.ThreadException += delegate(object s, System.Threading.ThreadExceptionEventArgs e) { HideTrayNow(); };
+        Application.ThreadException += delegate(object s, System.Threading.ThreadExceptionEventArgs e) { LogCrash("ThreadException", e.Exception); HideTrayNow(); };
         AppDomain.CurrentDomain.ProcessExit += delegate(object s, EventArgs e) { HideTrayNow(); };
         Application.ApplicationExit += delegate(object s, EventArgs e) { HideTrayNow(); };
         Application.Run(new TouchKeyboard());
@@ -2077,7 +2092,9 @@ public class TouchKeyboard : Form
     {
         try
         {
-            toggleEvent = new System.Threading.EventWaitHandle(false, System.Threading.EventResetMode.AutoReset, ToggleEventName);
+            bool eventNew = false;
+            toggleEvent = new System.Threading.EventWaitHandle(false, System.Threading.EventResetMode.AutoReset, ToggleEventName, out eventNew, WorldAccessibleEvent());
+            if (!eventNew) LogLaunch(true, "toggle-event-exists");
             System.Threading.Thread t = new System.Threading.Thread(delegate()
             {
                 while (true)
@@ -2096,8 +2113,8 @@ public class TouchKeyboard : Form
         catch { }
     }
 
-    // 记录每次启动的命令行 / 账户 / 会话，便于确认是谁拉起的（-Embedding = COM 拉起）
-    static void LogLaunch()
+    // 记录每次启动（第一/第二实例都记）：命令行 / 账户 / 会话 / 是否第一实例，便于确认是谁拉起的
+    static void LogLaunch(bool first, string note)
     {
         try
         {
@@ -2106,9 +2123,45 @@ public class TouchKeyboard : Form
                 + "  args=" + string.Join(" ", Environment.GetCommandLineArgs())
                 + "  user=" + Environment.UserName
                 + "  session=" + System.Diagnostics.Process.GetCurrentProcess().SessionId
+                + "  first=" + (first ? "1" : "0")
+                + "  " + note
                 + "\r\n";
             File.AppendAllText(p, line, Encoding.UTF8);
         }
         catch { }
+    }
+
+    // 未处理异常一律落盘：开机崩溃那次只能靠事件查看器捞，太费劲
+    static void LogCrash(string where, Exception ex)
+    {
+        try
+        {
+            string p = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "kb-crash.log");
+            File.AppendAllText(p, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
+                + "  [" + where + "] args=" + string.Join(" ", Environment.GetCommandLineArgs())
+                + "  user=" + Environment.UserName
+                + "  session=" + System.Diagnostics.Process.GetCurrentProcess().SessionId
+                + "\r\n" + (ex == null ? "(no exception object)" : ex.ToString()) + "\r\n", Encoding.UTF8);
+        }
+        catch { }
+    }
+
+    // 互斥体/命名事件跨用户共享（服务可能先以 SYSTEM 身份拉起），DACL 必须放行 Everyone
+    static System.Security.AccessControl.MutexSecurity WorldAccessibleMutex()
+    {
+        System.Security.AccessControl.MutexSecurity sec = new System.Security.AccessControl.MutexSecurity();
+        sec.AddAccessRule(new System.Security.AccessControl.MutexAccessRule(
+            new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.WorldSid, null),
+            System.Security.AccessControl.MutexRights.FullControl, System.Security.AccessControl.AccessControlType.Allow));
+        return sec;
+    }
+
+    static System.Security.AccessControl.EventWaitHandleSecurity WorldAccessibleEvent()
+    {
+        System.Security.AccessControl.EventWaitHandleSecurity sec = new System.Security.AccessControl.EventWaitHandleSecurity();
+        sec.AddAccessRule(new System.Security.AccessControl.EventWaitHandleAccessRule(
+            new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.WorldSid, null),
+            System.Security.AccessControl.EventWaitHandleRights.FullControl, System.Security.AccessControl.AccessControlType.Allow));
+        return sec;
     }
 }
