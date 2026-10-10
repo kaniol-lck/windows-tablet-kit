@@ -170,7 +170,7 @@ public class TouchKeyboard : Form
     bool appbarPendingShow = false;   // 贴底期间先隐藏，摆稳后再出现（避免"先闪到上方再跳下来"）
     bool settling = false;
 
-    const uint INPUT_KEYBOARD = 1, KEYEVENTF_KEYUP = 2, KEYEVENTF_EXTENDEDKEY = 1;
+    const uint INPUT_KEYBOARD = 1, KEYEVENTF_KEYUP = 2, KEYEVENTF_EXTENDEDKEY = 1, KEYEVENTF_UNICODE = 4;
     const int WM_NCLBUTTONDOWN = 0xA1, HTCAPTION = 2;
     const int WM_EXITSIZEMOVE = 0x0232, WM_NCHITTEST = 0x0084;
     const int WS_EX_NOACTIVATE = 0x08000000;
@@ -214,6 +214,12 @@ public class TouchKeyboard : Form
         public string Text = ""; public ushort Vk = 0; public float W = 1f;
         public bool NeedShift = false, Extended = false, IsClose = false;
         public string Latch = null;   // shift / ctrl / alt / win
+        public string Shifted = "";   // 键帽上方的 Shift 组合字符（双字键帽：基|翻档）
+        public string GoTo = null;    // go:区段名 → 点它切到该层
+        public byte[] Combo = null;   // combo:ctrl+shift+esc → 一键组合键（末位是主键）
+        public bool ZoneSplit = false;// 快捷层右区（功能键）首键：画一条竖直分隔线
+        public ushort Uni = 0;       // 非 ASCII 字符（全角标点）：走 KEYEVENTF_UNICODE 直发
+        public bool FnToggle = false; // fn 键：在本族的基础层与 Fn 层之间切换
     }
     class KbLayout
     {
@@ -442,37 +448,46 @@ public class TouchKeyboard : Form
     }
 
     // ============================ 布局文件 ============================
+    // 解析 layouts.ini（静态版：-checklayouts 无界面校验也用它）；bad != null 时收集无法识别的键名
+    static List<KbLayout> ParseLayoutFile(string path, List<string> bad)
+    {
+        List<KbLayout> res = new List<KbLayout>();
+        KbLayout cur = null;
+        foreach (string raw in File.ReadAllLines(path, Encoding.UTF8))
+        {
+            string line = raw.Trim();
+            if (line.Length == 0 || line.StartsWith(";") || line.StartsWith("#")) continue;
+            if (line.StartsWith("[") && line.EndsWith("]"))
+            {
+                cur = new KbLayout();
+                cur.Name = line.Substring(1, line.Length - 2).Trim();
+                res.Add(cur);
+                continue;
+            }
+            if (cur == null) continue;
+            if (line.StartsWith("Row:") || line.StartsWith("row:"))
+            {
+                List<KeySpec> row = new List<KeySpec>();
+                string body = line.Substring(4).Trim();
+                foreach (string tok in body.Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    KeySpec ks = ParseKey(tok);
+                    if (ks != null) row.Add(ks);
+                    else if (bad != null) bad.Add("[" + cur.Name + "] 无法识别的键名: " + tok);
+                }
+                if (row.Count > 0) cur.Rows.Add(row);
+            }
+        }
+        return res;
+    }
+
     void LoadLayouts()
     {
         layouts.Clear();
         try
         {
             if (!File.Exists(LayoutPath)) File.WriteAllText(LayoutPath, DefaultLayoutsText(), Encoding.UTF8);
-            KbLayout cur = null;
-            foreach (string raw in File.ReadAllLines(LayoutPath, Encoding.UTF8))
-            {
-                string line = raw.Trim();
-                if (line.Length == 0 || line.StartsWith(";") || line.StartsWith("#")) continue;
-                if (line.StartsWith("[") && line.EndsWith("]"))
-                {
-                    cur = new KbLayout();
-                    cur.Name = line.Substring(1, line.Length - 2).Trim();
-                    layouts.Add(cur);
-                    continue;
-                }
-                if (cur == null) continue;
-                if (line.StartsWith("Row:") || line.StartsWith("row:"))
-                {
-                    List<KeySpec> row = new List<KeySpec>();
-                    string body = line.Substring(4).Trim();
-                    foreach (string tok in body.Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries))
-                    {
-                        KeySpec ks = ParseKey(tok);
-                        if (ks != null) row.Add(ks);
-                    }
-                    if (row.Count > 0) cur.Rows.Add(row);
-                }
-            }
+            layouts.AddRange(ParseLayoutFile(LayoutPath, null));
         }
         catch { }
         if (layouts.Count == 0)
@@ -515,6 +530,26 @@ public class TouchKeyboard : Form
         }
         KeySpec k = new KeySpec();
         k.W = w;
+        // ---- 双字键帽：基|翻档（1|! 、[|{ 、\|| = 反斜杠键的 Shift 上是竖线）----
+        int bar = tok.IndexOf('|');
+        if (bar > 0 && bar < tok.Length - 1)
+        {
+            k.Shifted = tok.Substring(bar + 1);
+            tok = tok.Substring(0, bar);
+        }
+        // ---- 切层键：go:区段名 ----
+        if (tok.Length > 3 && tok.Substring(0, 3).ToLower() == "go:")
+        {
+            k.GoTo = tok.Substring(3);
+            k.Text = k.GoTo;
+            return k;
+        }
+        // ---- 一键组合键：combo:ctrl+shift+esc ----
+        if (tok.Length > 6 && tok.Substring(0, 6).ToLower() == "combo:")
+        {
+            k.Combo = ParseCombo(tok.Substring(6), out k.Text);
+            return k;
+        }
         string t = tok.ToLower();
         switch (t)
         {
@@ -533,6 +568,9 @@ public class TouchKeyboard : Form
             case "ctrl": k.Vk = 0x11; k.Text = "Ctrl"; k.Latch = "ctrl"; break;
             case "alt": k.Vk = 0x12; k.Text = "Alt"; k.Latch = "alt"; break;
             case "win": k.Vk = 0x5B; k.Text = "Win"; k.Latch = "win"; break;
+            case "menu": k.Vk = 0x5D; k.Text = "≡"; k.Extended = true; break;          // 菜单键
+            case "fn": k.FnToggle = true; k.Text = "Fn"; break;                        // Fn：切到本族 Fn 层
+            case "回车": k.Vk = 0x0D; k.Text = "回车"; break;                            // OSK 上 Enter 的写法
             case "space": k.Vk = 0x20; k.Text = "空格"; break;
             case "zh": k.Vk = 0x20; k.Text = "中英"; break;      // Ctrl+Space
             case "close": case "hide": k.Text = "✕"; k.IsClose = true; break;
@@ -559,60 +597,147 @@ public class TouchKeyboard : Form
                         k.Text = tok.ToUpper();
                         break;
                     }
+                    if (c > 0x7F) { k.Uni = c; k.Text = tok; break; }   // 全角标点等：Unicode 直发
                 }
                 return null;   // 无法识别
         }
         return k;
     }
 
+    // combo:ctrl+shift+esc → 一组虚拟键（末位是主键）；标签显示成 Ctrl+Shift+Esc
+    static byte[] ParseCombo(string spec, out string label)
+    {
+        List<byte> vks = new List<byte>();
+        StringBuilder sb = new StringBuilder();
+        foreach (string part in spec.Split('+'))
+        {
+            string p = part.Trim();
+            if (p.Length == 0) continue;
+            string low = p.ToLower();
+            ushort vk = 0; string disp = p;
+            switch (low)
+            {
+                case "ctrl": case "control": vk = 0x11; disp = "Ctrl"; break;
+                case "shift": vk = 0x10; disp = "Shift"; break;
+                case "alt": vk = 0x12; disp = "Alt"; break;
+                case "win": vk = 0x5B; disp = "Win"; break;
+                case "esc": case "escape": vk = 0x1B; disp = "Esc"; break;
+                case "tab": vk = 0x09; disp = "Tab"; break;
+                case "enter": vk = 0x0D; disp = "Enter"; break;
+                case "space": vk = 0x20; disp = "Space"; break;
+                case "left": vk = 0x25; disp = "←"; break;
+                case "right": vk = 0x27; disp = "→"; break;
+                case "up": vk = 0x26; disp = "↑"; break;
+                case "down": vk = 0x28; disp = "↓"; break;
+                case "del": case "delete": vk = 0x2E; disp = "Del"; break;
+                default:
+                    if (p.Length == 1)
+                    {
+                        short v = VkKeyScan(p[0]);
+                        if (v != -1) { vk = (ushort)(v & 0xFF); disp = p.ToUpper(); }
+                    }
+                    else if (low.Length >= 2 && low[0] == 'f' && char.IsDigit(low[1]))
+                    {
+                        int n;
+                        if (int.TryParse(low.Substring(1), out n) && n >= 1 && n <= 24) { vk = (ushort)(0x70 + n - 1); disp = "F" + n; }
+                    }
+                    break;
+            }
+            if (vk == 0) continue;
+            vks.Add((byte)vk);
+            if (sb.Length > 0) sb.Append('+');
+            sb.Append(disp);
+        }
+        label = sb.Length > 0 ? sb.ToString() : spec;
+        return vks.Count > 0 ? vks.ToArray() : null;
+    }
+
         static string DefaultLayoutsText()
     {
         StringBuilder sb = new StringBuilder();
         sb.AppendLine("; ================= 触控键盘布局文件 =================");
-        sb.AppendLine("; 保存后，点键盘上的「布局」按钮即可切换（会重新读取本文件）");
-        sb.AppendLine("; 每行一排：   Row: 键名[*宽度] 键名[*宽度] ...");
-        sb.AppendLine("; 键名可用：");
-        sb.AppendLine(";   单个字符：1 a ; / 等");
-        sb.AppendLine(";   功能键  ：esc tab caps enter bk(退格) del ins home end pgup pgdn");
-        sb.AppendLine(";             shift ctrl alt win space zh(中英=Ctrl+Space) close(✕)");
-        sb.AppendLine(";             left up down right    f1..f12");
-        sb.AppendLine("; 宽度：键名后加 *数字，默认 1（例如 space*4.6）");
-        sb.AppendLine("; 说明：下面四个布局全部以「系统」的 26 键排布为蓝本，只是各自增加额外按键，");
-        sb.AppendLine(";       所以切换布局时字母区位置不变，不会打乱手感。");
+        sb.AppendLine("; 顶栏「布局」按钮按“族”循环： 系统 → M → C → 系统");
+        sb.AppendLine("; 族内切层用键盘上的 go: 键（例如 [M·主] 里的 go:标点）");
+        sb.AppendLine("; 行格式： Row: 键名[*宽度] ...");
+        sb.AppendLine(";   单字符   ： 1  a  ;  /  等");
+        sb.AppendLine(";   双字键帽 ： 基|翻档  例 1|! 、[|{ 、\\||（反斜杠键的 Shift 上是竖线）");
+        sb.AppendLine(";              → 键帽上方小字显示 Shift 组合字符；Shift 闩锁时发翻档字符");
+        sb.AppendLine(";   功能键   ： esc tab caps enter bk del ins home end pgup pgdn");
+        sb.AppendLine(";              shift ctrl alt win space zh(=Ctrl+Space 中英) close left up down right f1..f12");
+        sb.AppendLine(";   切层键   ： go:区段名          组合键： combo:ctrl+shift+esc");
+        sb.AppendLine(";   宽度     ： 键名后加 *数字，默认 1（只有功能键需要非 1 宽度）");
         sb.AppendLine("");
         sb.AppendLine("[系统]");
-        sb.AppendLine("; 蓝本：参考 Windows 自带触摸键盘的排布");
-        sb.AppendLine("Row: 1 2 3 4 5 6 7 8 9 0 - = bk*2");
-        sb.AppendLine("Row: tab*1.5 q w e r t y u i o p [ ] \\*1.5");
-        sb.AppendLine("Row: caps*1.8 a s d f g h j k l ; ' enter*2.2");
-        sb.AppendLine("Row: shift*2.2 z x c v b n m , . / shift*1.8");
-        sb.AppendLine("Row: ctrl*1.4 zh*1.3 win*1.3 alt*1.3 space*4.6 left up down right close");
+        sb.AppendLine("; 参考基准：本机 Windows「屏幕键盘」(osk.exe) 实测布局（Win11 25H2 / zh-CN / 125% DPI）");
+        sb.AppendLine("; 实测：1 单位 = 78 物理 px；五行行宽 = 15.63 / 15.63 / 15.73 / 15.73 / 15.84（OSK 本身各行就有出入）");
+        sb.AppendLine("; 键帽双字：与 OSK 一致（Shift 组合字符画在键帽上方）；Fn 键切到本族 Fn 层");
+        sb.AppendLine("; 未复刻：右侧 3x5 导航簇（本 app 每行是一条流、做不了多列块；且其中 7 个键是 OSK 自身的 UI 控件）");
+        sb.AppendLine("; 实测行宽 15.63/15.63/15.73/15.73/15.84；为在逐行缩放下让各行等宽且 ↑/↓ 同列，");
+        sb.AppendLine("; 字符键一律保持实测 1u，仅微调 4 个功能键：⌫1.63→1.73、Del1.10→1.20、空格5.76→5.59、≡1.08→1.14");
+        sb.AppendLine("Row: esc `|~ 1|! 2|@ 3|# 4|$ 5|% 6|^ 7|& 8|* 9|( 0|) -|_ =|+ bk*1.73");
+        sb.AppendLine("Row: tab*1.53 q w e r t y u i o p [|{ ]|} \\|| del*1.20");
+        sb.AppendLine("Row: caps*2.06 a s d f g h j k l ;|: '|\" 回车*2.67");
+        sb.AppendLine("Row: shift*2.59 z x c v b n m ,|< .|> /|? up*1 shift*2.14");
+        sb.AppendLine("Row: fn ctrl win alt space*5.59 alt ctrl left down right menu*1.14");
         sb.AppendLine("");
-        sb.AppendLine("[默认]");
-        sb.AppendLine("; 系统蓝本 + 一排编辑/导航键（Esc Ins Home PgUp Del End PgDn）");
-        sb.AppendLine("Row: esc ins home pgup del end pgdn");
-        sb.AppendLine("Row: 1 2 3 4 5 6 7 8 9 0 - = bk*2");
-        sb.AppendLine("Row: tab*1.5 q w e r t y u i o p [ ] \\*1.5");
-        sb.AppendLine("Row: caps*1.8 a s d f g h j k l ; ' enter*2.2");
-        sb.AppendLine("Row: shift*2.2 z x c v b n m , . / shift*1.8");
-        sb.AppendLine("Row: ctrl*1.4 zh*1.3 win*1.3 alt*1.3 space*4.6 left up down right close");
+        sb.AppendLine("[系统·Fn]");
+        sb.AppendLine("; 系统布局的 Fn 层：数字行换成 F1..F12（与 OSK 的 Fn 行为一致），再按 Fn 回到 [系统]");
+        sb.AppendLine("Row: esc f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 del*1 bk*1.73");
+        sb.AppendLine("Row: tab*1.53 q w e r t y u i o p [|{ ]|} \\|| del*1.20");
+        sb.AppendLine("Row: caps*2.06 a s d f g h j k l ;|: '|\" 回车*2.67");
+        sb.AppendLine("Row: shift*2.59 z x c v b n m ,|< .|> /|? up*1 shift*2.14");
+        sb.AppendLine("Row: fn ctrl win alt space*5.59 alt ctrl left down right menu*1.14");
         sb.AppendLine("");
-        sb.AppendLine("[带Fn行]");
-        sb.AppendLine("; 系统蓝本 + 顶部 F1~F12 功能键排");
-        sb.AppendLine("Row: esc f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 del");
-        sb.AppendLine("Row: 1 2 3 4 5 6 7 8 9 0 - = bk*2");
-        sb.AppendLine("Row: tab*1.5 q w e r t y u i o p [ ] \\*1.5");
-        sb.AppendLine("Row: caps*1.8 a s d f g h j k l ; ' enter*2.2");
-        sb.AppendLine("Row: shift*2.2 z x c v b n m , . / shift*1.8");
-        sb.AppendLine("Row: ctrl*1.4 zh*1.3 win*1.3 alt*1.3 space*4.6 left up down right close");
+        sb.AppendLine("[M·主]");
+        sb.AppendLine("; 简化布局 M：字母区 ANSI 阶梯 1.5/1.75/2.0、倒 T 方向键、底行常驻「，。」");
+        sb.AppendLine("Row: esc*1.5 q w e r t y u i o p [|{ ]|} \\|| bk*1.5");
+        sb.AppendLine("Row: caps*1.75 a s d f g h j k l ;|: '|\" enter*3.25");
+        sb.AppendLine("Row: shift*2 z x c v b n m ,|< .|> /|? up*1 shift*2 del*1");
+        sb.AppendLine("Row: ctrl*1.25 go:标点*1.25 zh*1.5 ，*1 space*5.0 。*1 left*1 down*1 right*1 close*2");
         sb.AppendLine("");
-        sb.AppendLine("[简洁]");
-        sb.AppendLine("; 系统蓝本 + 只加 Esc 和 Del");
-        sb.AppendLine("Row: esc 1 2 3 4 5 6 7 8 9 0 - = bk*1.5");
-        sb.AppendLine("Row: tab*1.5 q w e r t y u i o p [ ] \\*1.5");
-        sb.AppendLine("Row: caps*1.8 a s d f g h j k l ; ' enter*2.2");
-        sb.AppendLine("Row: shift*2.2 z x c v b n m , . / shift*1.8");
-        sb.AppendLine("Row: ctrl*1.4 zh*1.3 win*1.3 alt*1.3 space*4.6 left up down right close");
+        sb.AppendLine("[M·标点]");
+        sb.AppendLine("; 数字行置顶（退格也在首行）；全角字符走 KEYEVENTF_UNICODE 直发；↑ 紧邻底行之上以保证倒 T");
+        sb.AppendLine("Row: esc*1 1|! 2|@ 3|# 4|$ 5|% 6|^ 7|& 8|* 9|( 0|) -|_ =|+ bk*3");
+        sb.AppendLine("Row: ， 。 、 ； ： ？ ！ “ ” ‘ ’ 《 》 （ ） del*1");
+        sb.AppendLine("Row: 】 ￥ · … — ※ ° ± × ÷ § ¶ up*1 † ‡ •");
+        sb.AppendLine("Row: ctrl*1.25 go:主*1.25 zh*1.5 ，*1 space*5.0 。*1 left*1 down*1 right*1 close*2");
+        sb.AppendLine("");
+        sb.AppendLine("[M·123]");
+        sb.AppendLine("Row: esc*1 `|~ 1|! 2|@ 3|# 4|$ 5|% 6|^ 7|& 8|* 9|( 0|) -|_ =|+ bk*2");
+        sb.AppendLine("Row: ! @ # $ % ^ & * ( ) _ + { } | ~");
+        sb.AppendLine("Row: [|{ ]|} \\|| ;|: '|\" ,|< .|> /|? -|_ =|+ `|~ @ up*1 # $ tab*1");
+        sb.AppendLine("Row: ctrl*1.25 go:主*1.25 zh*1.5 ，*1 space*5.0 。*1 left*1 down*1 right*1 close*2");
+        sb.AppendLine("");
+        sb.AppendLine("[M·快捷]");
+        sb.AppendLine("; 快捷层：左区组合键（combo:）/ 右区功能键，中间自动画分隔线");
+        sb.AppendLine("Row: combo:ctrl+c*2 combo:ctrl+x*2 combo:ctrl+v*2 combo:ctrl+a*2 esc*2 tab*2 caps*2 shift*2");
+        sb.AppendLine("Row: combo:ctrl+z*2 combo:ctrl+y*2 combo:ctrl+f*2 combo:ctrl+s*2 ctrl*2 alt*2 win*2 bk*2");
+        sb.AppendLine("Row: combo:alt+tab*2 combo:win+d*2 combo:ctrl+w*2 combo:alt+f4*2 pgup*2 pgdn*2 up*1 enter*3");
+        sb.AppendLine("Row: ctrl*1.25 go:主*1.25 zh*1.5 ，*1 space*5.0 。*1 left*1 down*1 right*1 close*2");
+        sb.AppendLine("");
+        sb.AppendLine("[C·主]");
+        sb.AppendLine("; 标准布局 C：ANSI 主键区原样 + 数字行常驻");
+        sb.AppendLine("Row: esc*1 `|~ 1|! 2|@ 3|# 4|$ 5|% 6|^ 7|& 8|* 9|( 0|) -|_ =|+ bk*2");
+        sb.AppendLine("Row: tab*1.5 q w e r t y u i o p [|{ ]|} \\|| ins*1.5");
+        sb.AppendLine("Row: caps*1.75 a s d f g h j k l ;|: '|\" enter*3.25");
+        sb.AppendLine("Row: shift*2 z x c v b n m ,|< .|> /|? up*1 shift*2 del*1");
+        sb.AppendLine("Row: ctrl*1.25 go:符号*1.25 zh*1.25 alt*1.25 win*1.25 space*4.75 left*1 down*1 right*1 close*2");
+        sb.AppendLine("");
+        sb.AppendLine("[C·符号]");
+        sb.AppendLine("; F 功能键行置顶；导航键成对；倒 T 的 ↑ 紧邻底行之上");
+        sb.AppendLine("Row: esc*1 f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 bk*3");
+        sb.AppendLine("Row: ! @ # $ % ^ & * ( ) _ + { } | ~");
+        sb.AppendLine("Row: [|{ ]|} \\|| ;|: '|\" ,|< .|> /|? -|_ =|+ `|~ @ # $ % &");
+        sb.AppendLine("Row: ins*2 home*2 pgup*2 del*2 end*2 pgdn*2 up*1 enter*3");
+        sb.AppendLine("Row: ctrl*1.25 go:主*1.25 zh*1.25 alt*1.25 win*1.25 space*4.75 left*1 down*1 right*1 close*2");
+        sb.AppendLine("");
+
+        sb.AppendLine("[C·快捷]");
+        sb.AppendLine("Row: combo:ctrl+c*2 combo:ctrl+x*2 combo:ctrl+v*2 combo:ctrl+a*2 esc*2 tab*2 caps*2 shift*2");
+        sb.AppendLine("Row: combo:ctrl+z*2 combo:ctrl+y*2 combo:ctrl+f*2 combo:ctrl+s*2 ctrl*2 alt*2 win*2 bk*2");
+        sb.AppendLine("Row: combo:alt+tab*2 combo:win+d*2 combo:ctrl+w*2 combo:alt+f4*2 ins*2 home*2 end*2 del*2");
+        sb.AppendLine("Row: combo:win+e*2 combo:win+r*2 combo:ctrl+shift+esc*2 combo:win+shift+s*2 pgup*2 pgdn*2 up*1 enter*3");
+        sb.AppendLine("Row: ctrl*1.25 go:主*1.25 zh*1.25 alt*1.25 win*1.25 space*4.75 left*1 down*1 right*1 close*2");
         sb.AppendLine("");
         return sb.ToString();
     }
@@ -908,9 +1033,20 @@ public class TouchKeyboard : Form
 
     void CycleLayout()
     {
-        int target = (layouts.Count > 0) ? (layoutIndex + 1) % layouts.Count : 0;
-        LoadLayouts();                       // 重新读取 layouts.ini（支持随时编辑后点“布局”生效）
-        if (target >= layouts.Count) target = 0;
+        // 顶栏「布局」按钮按“族”循环：系统 → M → C → 系统；族内切层用键盘上的 go: 键
+        // （LoadLayouts 会重载并归零索引，所以先记住当前层名与族名）
+        string curName = Active.Name;
+        string fam = FamilyOf(curName);
+        LoadLayouts();
+        if (layouts.Count == 0) return;
+        int curIdx = 0;
+        for (int i = 0; i < layouts.Count; i++) if (layouts[i].Name == curName) { curIdx = i; break; }
+        int target = (curIdx + 1) % layouts.Count;
+        for (int step = 1; step <= layouts.Count; step++)
+        {
+            int idx = (curIdx + step) % layouts.Count;
+            if (!string.Equals(FamilyOf(layouts[idx].Name), fam, StringComparison.Ordinal)) { target = idx; break; }
+        }
         layoutIndex = target;
         // 不同布局的关键排数可能不同：高度跟着调整（否则 6 排会被压扁）
         if (dockBottom) ApplyDock(true);
@@ -979,38 +1115,78 @@ public class TouchKeyboard : Form
 
         int rows = Active.Rows.Count;
         if (rows == 0) { building = false; return; }
-        int availH = ClientSize.Height - chromeTop - stripH - (rows + 1) * gap;
+        // 快捷层：左区（组合键）/ 右区（功能键）→ 给右区首键标记分隔线
+        if (Active.Name.EndsWith("快捷"))
+        {
+            for (int r = 0; r < rows; r++)
+            {
+                bool hasCombo = false, marked = false;
+                List<KeySpec> rr = Active.Rows[r];
+                for (int i = 0; i < rr.Count; i++)
+                {
+                    if (rr[i].Combo != null) hasCombo = true;
+                    else if (hasCombo && !marked) { rr[i].ZoneSplit = true; marked = true; }
+                }
+            }
+        }
+        // 上下左右都按 margin 对称排布：内容高 = 客户区 - 顶栏 - 2×margin - 行间间隙
+        int availH = ClientSize.Height - chromeTop - stripH - 2 * margin - (rows - 1) * gap;
         int kh = availH / rows;
         if (kh < 26) kh = 26;
-        int areaTop = chromeTop + stripH + gap;
+        int areaTop = chromeTop + stripH + margin;
 
-        // 每排按键各自按“单位数”撑满宽度；行高统一由窗口高度决定（可自由纵向拉伸）
+        // 单位宽按“本层最大行单位”统一计算（与 DesiredHeight 一致）：
+        // 这样同一层里所有 1u 键在任何一行都是同一个宽度，不会因为某行键少而被撑宽
+        float maxUnits = 0f;
+        for (int r0 = 0; r0 < rows; r0++)
+        {
+            float t0 = 0f;
+            for (int i0 = 0; i0 < Active.Rows[r0].Count; i0++) t0 += Active.Rows[r0][i0].W;
+            if (t0 > maxUnits) maxUnits = t0;
+        }
+        if (maxUnits <= 0f) { building = false; return; }
+        // 槽位宽：每 1u 占 (客户区宽 - 2×margin) / 最大行单位；键宽 = 槽宽 - 间隙
+        float slot = (ClientSize.Width - 2f * margin) / maxUnits;
+
+        // 行高统一由窗口高度决定（可自由纵向拉伸）
         for (int r = 0; r < rows; r++)
         {
             List<KeySpec> row = Active.Rows[r];
             float total = 0f;
             for (int i = 0; i < row.Count; i++) total += row[i].W;
             if (total <= 0f) continue;
-
-            int usable = ClientSize.Width - 2 * margin - (int)Math.Round((double)((row.Count + 1) * gap));
-            float unit = usable / total;
             int y = areaTop + r * (kh + gap);
 
-            float x = margin + gap;
+            float cu = 0f;   // 本行已累计的单位数（浮点累计，避免逐键取整把误差滚到行尾）
             for (int i = 0; i < row.Count; i++)
             {
                 KeySpec k = row[i];
-                int kw = (int)Math.Round(k.W * unit + (k.W - 1) * gap);
+                int left = (int)Math.Round(margin + cu * slot + gap / 2.0);
+                int right = (int)Math.Round(margin + (cu + k.W) * slot + gap / 2.0);
+                int kw = right - left - gap;
+                if (kw < 8) kw = 8;
                 Button b = new Button();
                 b.Text = k.Text;
                 b.FlatStyle = FlatStyle.Flat;
                 b.FlatAppearance.BorderSize = 0;
                 b.TabStop = false;
+                b.UseMnemonic = false;      // 否则 "&" 被当成助记符前缀 → 键帽显示空白
                 b.ForeColor = Color.White;
-                b.Font = KeyFont(b.Text, kw, kh);
+                // 双字键帽：字号按"基+翻档"两个字符一起收缩；文字由 PaintKeyExtra 自绘
+                b.Font = KeyFont(k.Shifted.Length > 0 ? k.Text + k.Shifted : b.Text, kw, kh);
+                if (k.Shifted.Length > 0 || k.ZoneSplit)
+                {
+                    KeySpec kd = k;
+                    if (k.Shifted.Length > 0) b.Text = "";
+                    b.Paint += new PaintEventHandler(delegate(object s2, PaintEventArgs e2) { PaintKeyExtra((Button)s2, kd, e2.Graphics); });
+                }
                 b.Size = new Size(kw, kh);
-                b.Location = new Point((int)Math.Round(x), y);
-                b.BackColor = (k.Latch != null) ? Color.FromArgb(58, 72, 100) : (k.IsClose ? Color.FromArgb(110, 45, 45) : Color.FromArgb(62, 62, 68));
+                b.Location = new Point(left, y);
+                if (k.IsClose) b.BackColor = Color.FromArgb(110, 45, 45);
+                else if (k.Latch != null) b.BackColor = Color.FromArgb(58, 72, 100);        // 修饰键：蓝灰
+                else if (k.Combo != null) b.BackColor = Color.FromArgb(74, 58, 96);         // 组合键：紫
+                else if (IsArrowVk(k.Vk)) b.BackColor = Color.FromArgb(48, 84, 76);         // 方向键：墨绿
+                else b.BackColor = Color.FromArgb(62, 62, 68);
                 b.Tag = k;
                 if (k.Vk > 0) { List<Button> vl; if (!vkMap.TryGetValue(k.Vk, out vl)) { vl = new List<Button>(); vkMap[k.Vk] = vl; } vl.Add(b); }
                 baseColors[b] = b.BackColor;
@@ -1018,7 +1194,7 @@ public class TouchKeyboard : Form
                 b.MouseUp += new MouseEventHandler(KeyUp2);
                 Controls.Add(b);
                 if (k.Latch != null) latchButtons.Add(b);
-                x += kw + gap;
+                cu += k.W;
             }
         }
         UpdateLatchColors();
@@ -1034,6 +1210,9 @@ public class TouchKeyboard : Form
         if (k == null) return;
 
         if (k.IsClose) { HideKeyboard(true); return; }
+        if (k.GoTo != null) { SwitchLayout(k.GoTo); return; }
+        if (k.FnToggle) { ToggleFnLayer(); return; }
+        if (k.Combo != null) { SendCombo(k.Combo); return; }
         if (k.Latch != null)
         {
             if (stickyMode == 2)
@@ -1180,7 +1359,7 @@ public class TouchKeyboard : Form
         float unit = usable / maxUnits;
         int kh = (int)(unit * 0.85f);
         if (kh < 26) kh = 26;
-        int auto = chromeTop + stripH + gap + rows * (kh + gap) + gap;
+        int auto = chromeTop + stripH + 2 * margin + rows * kh + (rows - 1) * gap;
         if (dockBottom && dockHeightUser > 0)          // 用户用顶部手柄调过高度就用他的
         {
             int max = ScreenBounds().Height - 160;
@@ -1600,6 +1779,9 @@ public class TouchKeyboard : Form
     void TouchDown(KeySpec k, Button b)
     {
         if (k.IsClose) { HideKeyboard(true); return; }
+        if (k.GoTo != null) { SwitchLayout(k.GoTo); return; }
+        if (k.FnToggle) { ToggleFnLayer(); return; }
+        if (k.Combo != null) { SendCombo(k.Combo); return; }
         if (k.Latch != null)
         {
             if (stickyMode == 2) SetHold(k.Latch, true); else ToggleLatch(k.Latch);
@@ -1650,6 +1832,7 @@ public class TouchKeyboard : Form
     void PressKey(KeySpec k)
     {
         Dbg("press vk=" + k.Vk);
+        if (k.Uni != 0) { SendUnicode((char)k.Uni); return; }   // 全角标点：Unicode 直发
         bool ctrl = latchCtrl || holdCtrl, alt = latchAlt || holdAlt, win = latchWin || holdWin, shift = latchShift || holdShift || k.NeedShift;
         if (k.Text == "中英") Combo(0x20, false, true, false, false, false);
         else Combo(k.Vk, shift, ctrl, alt, win, k.Extended);
@@ -2022,6 +2205,214 @@ public class TouchKeyboard : Form
         if (!embedToggleSeen && !Visible) ShowKeyboard(true);      // 调用方没走 COM（服务直接拉起）→ 自己显示
     }
 
+    // ============================ 布局切换 / 组合键 / 双字键帽 / 校验 ============================
+    // 族名：区段名里 '·' 之前的部分（[M·主] → M；[系统] → 系统）
+    static string FamilyOf(string name)
+    {
+        int i = name.IndexOf('·');
+        return (i > 0) ? name.Substring(0, i) : name;
+    }
+
+    static int FindLayout(List<KbLayout> all, string name)
+    {
+        for (int i = 0; i < all.Count; i++)
+            if (string.Equals(all[i].Name, name, StringComparison.OrdinalIgnoreCase)) return i;
+        return -1;
+    }
+
+    static string FirstOfFamily(List<KbLayout> all, string fam)
+    {
+        foreach (KbLayout L in all) if (FamilyOf(L.Name) == fam) return L.Name;
+        return "";
+    }
+
+    // go:区段名 —— 切到该层（族内切层；顶栏「布局」按钮按族循环）
+    void SwitchLayout(string name)
+    {
+        try
+        {
+            int idx = FindLayout(layouts, name);
+            // 族内相对名：go:主 / go:标点 → 当前族的 "M·主" / "M·标点"
+            if (idx < 0) idx = FindLayout(layouts, FamilyOf(Active.Name) + "·" + name);
+            if (idx < 0) { Dbg("switch layout not found: " + name); return; }
+            layoutIndex = idx;
+            if (dockBottom) ApplyDock(true);
+            else
+            {
+                int wantH = DesiredHeight();
+                if (wantH > 120 && wantH != Height)
+                {
+                    int oldBottom = Bottom;
+                    ClientSize = new Size(ClientSize.Width, wantH);
+                    Top = oldBottom - Height;
+                }
+            }
+            BuildKeys();
+            LayoutChrome();
+            RefreshHeader();
+            Invalidate();
+            SaveSettings();
+            Dbg("switch layout -> " + name);
+        }
+        catch { }
+    }
+
+    // 方向键（← ↑ ↓ →）用独立配色，便于一眼定位
+    static bool IsArrowVk(ushort vk)
+    {
+        return vk == 0x25 || vk == 0x26 || vk == 0x27 || vk == 0x28;
+    }
+
+    // fn 键：在本族基础层与 <族>·Fn 之间切换（对应 OSK 按 Fn 后数字行变 F1..F12）
+    void ToggleFnLayer()
+    {
+        string fam = FamilyOf(Active.Name);
+        if (Active.Name == fam + "·Fn") SwitchLayout(fam);
+        else SwitchLayout("Fn");
+    }
+
+    // combo:ctrl+shift+esc —— 依次按下修饰键 → 主键 → 反向松开（Win 等按扩展键发）
+    static void SendCombo(byte[] vks)
+    {
+        if (vks == null || vks.Length == 0) return;
+        int last = vks.Length - 1;
+        for (int i = 0; i < last; i++) SendVk(vks[i], false, IsExtVk(vks[i]));
+        System.Threading.Thread.Sleep(6);
+        SendVk(vks[last], false, IsExtVk(vks[last]));
+        System.Threading.Thread.Sleep(6);
+        SendVk(vks[last], true, IsExtVk(vks[last]));
+        for (int i = last - 1; i >= 0; i--) SendVk(vks[i], true, IsExtVk(vks[i]));
+    }
+
+    static bool IsExtVk(byte vk)
+    {
+        return vk == 0x5B || vk == 0x5C || vk == 0x2E || vk == 0x24 || vk == 0x23 || vk == 0x21 || vk == 0x22
+            || vk == 0x25 || vk == 0x26 || vk == 0x27 || vk == 0x28 || vk == 0x2D;
+    }
+
+    // 非 ASCII 字符（，。、；：？！“”《》（）￥…※°±×÷ 等）：KEYEVENTF_UNICODE 直发，
+    // 绕过键盘布局与输入法，所以"全角标点直出"不依赖 IME 的标点转换
+    static void SendUnicode(char c)
+    {
+        INPUT[] a = new INPUT[2];
+        a[0].type = INPUT_KEYBOARD;
+        a[0].u.ki.wVk = 0; a[0].u.ki.wScan = c;
+        a[0].u.ki.dwFlags = KEYEVENTF_UNICODE; a[0].u.ki.time = 0; a[0].u.ki.dwExtraInfo = IntPtr.Zero;
+        a[1] = a[0];
+        a[1].u.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        SendInput(2, a, InputSize);
+    }
+
+    // 双字键帽：Shift 组合字符画在键帽上方（与 Windows「屏幕键盘」一致）；
+    // 快捷层右区（功能键）首键再画一条竖直分隔线
+    void PaintKeyExtra(Button b, KeySpec k, Graphics g)
+    {
+        try
+        {
+            Rectangle r = b.ClientRectangle;
+            if (k.ZoneSplit)
+            {
+                using (Pen p = new Pen(Color.FromArgb(118, 118, 136), 2))
+                    g.DrawLine(p, 1, 3, 1, r.Height - 4);
+            }
+            if (k.Shifted.Length == 0) return;
+            int topH = (int)(r.Height * 0.42f);
+            float bs = Math.Max(7f, b.Font.Size * 0.74f);
+            if (bs > b.Font.Size) bs = b.Font.Size;
+            using (Font fs = new Font(b.Font.FontFamily, bs))
+            {
+                TextRenderer.DrawText(g, k.Shifted, fs, new Rectangle(r.X, r.Y + 1, r.Width, topH),
+                    Color.FromArgb(212, 212, 226),
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+            }
+            using (Font fb = new Font(b.Font.FontFamily, b.Font.Size))
+            {
+                TextRenderer.DrawText(g, k.Text, fb, new Rectangle(r.X, r.Y + topH - 2, r.Width, r.Height - topH + 2),
+                    b.ForeColor,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+            }
+        }
+        catch { }
+    }
+
+    // -checklayouts：无界面校验 layouts.ini（未知键名 / 行宽是否一致 / go: 目标 / 族循环顺序）
+    static void CheckLayouts()
+    {
+        string dir = Path.GetDirectoryName(Application.ExecutablePath);
+        string path = Path.Combine(dir, "layouts.ini");
+        string outp = Path.Combine(dir, "layouts-check.txt");
+        StringBuilder sb = new StringBuilder();
+        try
+        {
+            if (!File.Exists(path)) { File.WriteAllText(path, DefaultLayoutsText(), Encoding.UTF8); sb.AppendLine("(layouts.ini 不存在 → 已写出内置默认布局)"); }
+            List<string> bad = new List<string>();
+            List<KbLayout> all = ParseLayoutFile(path, bad);
+            sb.AppendLine("=== layouts.ini 校验 ===");
+            sb.AppendLine("文件: " + path);
+            sb.AppendLine("区段数: " + all.Count + "   无法识别的键名: " + bad.Count);
+            foreach (string s2 in bad) sb.AppendLine("  x " + s2);
+            sb.AppendLine();
+            int uniKeys = 0, dualKeys = 0, combos = 0, goKeys = 0;
+            foreach (KbLayout L in all)
+            {
+                float maxU = 0f, minU = 999f;
+                int nKeys = 0;
+                sb.AppendLine("[" + L.Name + "]  族=" + FamilyOf(L.Name) + "  行数=" + L.Rows.Count);
+                for (int r = 0; r < L.Rows.Count; r++)
+                {
+                    float sum = 0f;
+                    foreach (KeySpec k in L.Rows[r])
+                    {
+                        sum += k.W; nKeys++;
+                        if (k.Shifted.Length > 0) dualKeys++;
+                        if (k.Combo != null) combos++;
+                        if (k.GoTo != null) goKeys++;
+                        if (k.Uni != 0) uniKeys++;
+                    }
+                    if (sum > maxU) maxU = sum;
+                    if (sum < minU) minU = sum;
+                    sb.AppendLine("  行" + (r + 1) + "  键数=" + L.Rows[r].Count + "  单位总和=" + sum.ToString("0.00"));
+                }
+                sb.AppendLine("  → maxUnits=" + maxU.ToString("0.00") + " minUnits=" + minU.ToString("0.00")
+                    + (Math.Abs(maxU - minU) < 0.005f ? "  OK 行宽一致" : "  ! 行宽不一致（同层内键宽会变化）")
+                    + "  键数=" + nKeys);
+                sb.AppendLine();
+            }
+            sb.AppendLine("--- go: 切层目标 ---");
+            int miss = 0;
+            foreach (KbLayout L in all)
+                foreach (List<KeySpec> row in L.Rows)
+                    foreach (KeySpec k in row)
+                        if (k.GoTo != null)
+                        {
+                            bool found = FindLayout(all, k.GoTo) >= 0
+                                      || FindLayout(all, FamilyOf(L.Name) + "·" + k.GoTo) >= 0;
+                            if (!found) { miss++; sb.AppendLine("  x [" + L.Name + "] go:" + k.GoTo + " 目标不存在"); }
+                        }
+            if (miss == 0) sb.AppendLine("  OK 全部 " + goKeys + " 个 go: 目标都存在"); else sb.AppendLine("  x 缺失 " + miss + " 个目标");
+            // fn 键：检查 <族>·Fn 层是否存在
+            int fnKeys = 0, fnMiss = 0;
+            foreach (KbLayout L in all)
+            {
+                bool hasFn = false;
+                foreach (List<KeySpec> row in L.Rows) foreach (KeySpec k in row) if (k.FnToggle) { hasFn = true; fnKeys++; }
+                if (hasFn && FindLayout(all, FamilyOf(L.Name) + "·Fn") < 0)
+                { fnMiss++; sb.AppendLine("  x [" + L.Name + "] fn 键需要 " + FamilyOf(L.Name) + "·Fn 层，但没有"); }
+            }
+            if (fnKeys > 0) sb.AppendLine(fnMiss == 0 ? "  OK " + fnKeys + " 个 fn 键都有对应的 <族>·Fn 层" : "  x fn 层缺失 " + fnMiss + " 个");
+            sb.AppendLine();
+            sb.AppendLine("--- 顶栏「布局」按钮的循环顺序（按族）---");
+            List<string> fams = new List<string>();
+            foreach (KbLayout L in all) { string f = FamilyOf(L.Name); if (!fams.Contains(f)) fams.Add(f); }
+            for (int i = 0; i < fams.Count; i++) sb.AppendLine("  " + (i + 1) + ") " + fams[i] + "   首层: " + FirstOfFamily(all, fams[i]));
+            sb.AppendLine("  → 循环: " + string.Join(" → ", fams.ToArray()) + " → " + (fams.Count > 0 ? fams[0] : "-"));
+            sb.AppendLine();
+            sb.AppendLine("统计: 双字键帽=" + dualKeys + "  组合键=" + combos + "  切层键=" + goKeys + "  Unicode直发键=" + uniKeys);
+        }
+        catch (Exception ex) { sb.AppendLine("校验失败: " + ex); }
+        try { File.WriteAllText(outp, sb.ToString(), Encoding.UTF8); } catch { }
+    }
+
     // ============================ 入口 ============================
     [STAThread]
     public static void Main()
@@ -2030,6 +2421,8 @@ public class TouchKeyboard : Form
         {
             LogCrash("UnhandledException", e.ExceptionObject as Exception);
         };
+        // -checklayouts：不开界面，只解析 layouts.ini 并把报告写进 layouts-check.txt（便于脚本化验证）
+        if (GetArgStatic("-checklayouts")) { CheckLayouts(); return; }
         bool created = false;
         System.Threading.Mutex mtx = null;
         try
