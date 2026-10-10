@@ -1,4 +1,4 @@
-# TouchRedirect 卸载（需要管理员，脚本会自己请求提权）
+﻿# TouchRedirect 卸载（需要管理员，脚本会自己请求提权）
 # 删除：进程、C:\Program Files\TouchRedirect\、开始菜单快捷方式、本机受信任存储与 CurrentUser\My 里的自签证书。
 # 保留：%LOCALAPPDATA%\TouchRedirect\（名单与日志），要一并删就加 -PurgeData。
 param([switch]$PurgeData)

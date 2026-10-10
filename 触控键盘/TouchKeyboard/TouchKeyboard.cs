@@ -1,4 +1,4 @@
-// TouchKeyboard.cs —— 轻量触控屏幕键盘（为无 TabTip/osK 可用的 Windows 10 平板编写）
+﻿// TouchKeyboard.cs —— 轻量触控屏幕键盘（为无 TabTip/osK 可用的 Windows 10 平板编写）
 // 特点：无边框置顶、WS_EX_NOACTIVATE 不抢焦点（按键直接送进当前焦点窗口）、大按键、Shift/Ctrl/Alt/Win 可锁定
 // 编译：Add-Type -OutputAssembly ... -OutputType WindowsApplication
 using System;

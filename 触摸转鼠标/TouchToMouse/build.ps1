@@ -1,4 +1,4 @@
-# 编译 TouchToMouse.cs -> TouchToMouse.exe（控制台子系统）
+﻿# 编译 TouchToMouse.cs -> TouchToMouse.exe（控制台子系统）
 $ErrorActionPreference = 'Stop'
 
 $src = Join-Path $PSScriptRoot 'TouchToMouse.cs'

@@ -1,4 +1,4 @@
-# TouchRedirect 安装（需要管理员，脚本会自己请求提权）
+﻿# TouchRedirect 安装（需要管理员，脚本会自己请求提权）
 #
 #  ① 备好自签代码签名证书（CN=TouchRedirect Local Test），并装进本机「受信任的根」与「受信任的发布者」
 #  ② 用 csc.exe 编译 TouchRedirect.cs（带 app.manifest：uiAccess=true + asInvoker）

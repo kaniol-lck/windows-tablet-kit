@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 rem Experiment: capture 20 screenshots while you tap the game, to tell a software
 rem cursor [drawn into the frame, appears in the capture] from a hardware cursor
 rem [NOT included in GDI captures].

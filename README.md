@@ -113,6 +113,18 @@ Add-Type -TypeDefinition $code -Language CSharp `
   [机器环境-详细诊断记录.md](机器环境-详细诊断记录.md)；
 - git 历史完整保留（目录移动被识别为 rename）。
 
+## 编码约定
+
+仓库里所有文本文件都是 **UTF-8**，但**是否带 BOM 取决于谁来读它**——这是实测出来的规则，别改：
+
+| 文件类型 | 编码 | 原因 |
+|---|---|---|
+| `.ps1` / `.cs` | **UTF-8 with BOM** | 受支持的 PowerShell 是 Windows PowerShell 5.1，它按 **ANSI 代码页**解码无 BOM 的 `.ps1`：中文变乱码，严重时注释里的字节会让整个脚本**解析失败**。`.cs` 与仓库既有文件（`TouchKeyboard.v2.cs`、`TouchRedirect.cs`）保持一致 |
+| `.cmd` | **UTF-8 无 BOM** + 首行 `chcp 65001 >nul` | 实测：给 `.cmd` 加 BOM 后，在 936 / 437 代码页下 cmd 解析首行报错、命令被拼坏；无 BOM + `chcp 65001` 则在 936 / 437 / 65001 下都能正确解析。**凡是 `.cmd` 里出现中文路径，必须有这一行** |
+| `.md` / `.txt` | UTF-8 无 BOM | Markdown 与 GitHub 的通行约定；`games.txt` 是被 `for /f "usebackq tokens=* eol=;"` 读的，加 BOM 会让首行 `;` 注释不再以 `;` 开头而被当成进程名 |
+
+新增脚本时请按上表保存；在无 BOM 的 `.ps1` 里写中文路径，实测会得到"文件不存在"这类莫名其妙的报错。
+
 ## 免责声明
 
 - 本仓库脚本会**修改系统设置**（注册表、服务、计划任务、启动项）与**显示方向**，并会**移动大量个人文件**。
